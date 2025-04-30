@@ -1,0 +1,73 @@
+import { Buffer } from "./buffer";
+import { BufferBinding } from "./buffer_binding";
+import { Context } from "./context";
+import { TypeInfo } from "./utils";
+import { interleaveTypeArrays } from "./utils";
+import { Attribute } from "./attribute";
+import { TypeArray } from "./types";
+
+
+type VertexStateParams = {
+    attributes: Record<string, Attribute>,
+    stepMode?: GPUVertexStepMode,
+    bufferBinding?: BufferBinding
+}
+
+export class VertexState {
+
+    context: Context
+    attributes: Record<string, Attribute>
+    stepMode: GPUVertexStepMode
+    binding: BufferBinding
+    bufferLayout: GPUVertexBufferLayout
+
+    constructor(context: Context, params: VertexStateParams) {
+        this.context = context;
+        this.attributes = params.attributes;
+        this.stepMode = params.stepMode ?? 'vertex'
+        this.binding = params.bufferBinding;    //for given buffer
+        this.updateVertexBuffer();
+    }
+
+    updateVertexBuffer() {
+        let arrayStride = 0;
+        let attributes = [];
+        let arrays = [];
+        let counts = [];
+
+        for (let name in this.attributes) {
+            let vari = this.attributes[name]
+            let info = TypeInfo[vari.type]
+            attributes.push({
+                format: info.format,
+                offset: arrayStride,
+                shaderLocation: vari.location
+            })
+            arrayStride += info.size;
+            counts.push(info.numElements)
+            arrays.push(vari.data)
+        }
+        if (attributes.length === 0) return;
+
+        this.bufferLayout = {
+            arrayStride: arrayStride,
+            stepMode: this.stepMode,
+            attributes: attributes
+        }
+        if (!this.binding) {
+            //interleaveArray
+            let array: TypeArray;
+            if (arrays.length === 0) {
+                array = arrays[0]
+            } else {
+                let view = arrays[0].constructor
+                array = interleaveTypeArrays(view, counts, ...arrays);
+            }
+            this.binding = new BufferBinding(Buffer.createVertex(this.context, array));
+        }
+        arrays = null;
+        counts = null;
+    }
+
+
+}
