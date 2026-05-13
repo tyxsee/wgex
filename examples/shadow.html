@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+
+<body>
+    <canvas id="container" style="width: 800px; height: 800px">容器</canvas>
+    <script type="module">
+
+        import {
+            Context, RenderTarget, Attachment, CommandEncoder, Pipeline, Pass, PassNode,
+            BindGroup, Shader, BufferBinding, Buffer, Texture, Sampler,
+            VertexState, UniformGroup, IndexState, Attribute,
+            ShaderStage
+
+        } from '../core/index'
+
+        import { Camera } from './libs/controls/orbit_camera'
+        import * as mesh from './libs/stanfordDragon'
+        import { mat4, vec3 } from 'gl-matrix'
+
+        let context = new Context({ canvas: document.querySelector('#container') })
+        await context.init();
+        let code = `
+@group(0) @binding(0) var<uniform> modelMatrix: mat4x4f;
+@group(0) @binding(1) var<uniform> viewMatrix: mat4x4f;
+@group(0) @binding(2) var<uniform> projectionMatrix: mat4x4f;
+@group(0) @binding(3) var lightShadowMap: texture_depth_2d;
+@group(0) @binding(4) var linearSampler: sampler_comparison;
+@group(0) @binding(5) var<uniform> lightViewMatrix: mat4x4f;
+
+
+struct VertexOutput {
+  @builtin(position) Position : vec4f,
+  @location(0) fragColor: vec3f,
+  @location(1) worldPos: vec3f,
+  @location(2) normal: vec3f
+}
+
+@vertex
+fn main_vs(    
+    @location(0) position: vec3f,
+    @location(1) normal : vec3f) -> VertexOutput {
+  var output : VertexOutput;
+  output.Position = projectionMatrix*viewMatrix*modelMatrix*vec4f(position,1.0);
+  output.fragColor = normalize(normal)*0.5+0.5;
+  output.normal = normal;
+  output.worldPos = (modelMatrix*vec4f(position,1.0)).xyz;
+  return output;
+}
+@fragment
+fn main_fs(@location(0) fragColor: vec3f, @location(1) worldPos: vec3f, @location(2) normal: vec3f) -> @location(0) vec4f {
+
+    var positionInLight:vec4f = lightViewMatrix*vec4f(worldPos,1.0);
+    var posProjected:vec3f = positionInLight.xyz/positionInLight.w;
+    var shadowPos: vec3<f32> = vec3(posProjected.xy * vec2(0.5, -0.5) + vec2(0.5), posProjected.z);
+
+    var lightPosition = vec3f(100, 100, 100);
+    var lightDir = normalize(lightPosition - worldPos);
+    var m = 200./1024./ 2.0;        //正交矩阵宽高/shadowmap分辨率/2
+    var NoL:f32 = dot(normalize(normal), lightDir);
+
+    var bias = 0.01;
+
+    // three
+    // var bias = max(m, m * (1.0 - NoL)) * 1.4;
+    // var bias = max(0.05 * (1.0 - abs(NoL)), 0.02) / positionInLight.w;
+
+    // var bias:f32 = max(bias * (1.0 - NoL), 0.000005);
+
+    //orillusion
+    // var bias = 0.01 / max(abs(NoL), 0.000001);
+
+    let oneOverShadowDepthTextureSize = 1.0 / vec2f(textureDimensions(lightShadowMap));
+
+    let uv = shadowPos.xy;
+    var depth = shadowPos.z;
+
+    var visibility=0.0;    
+    var PCF_RADIUS = 2;
+    for (var y = -PCF_RADIUS; y <= PCF_RADIUS; y++) {
+        for (var x = -PCF_RADIUS; x <= PCF_RADIUS; x++) {
+            let offset = vec2<f32>(vec2(x, y)) * oneOverShadowDepthTextureSize;
+            visibility += textureSampleCompare(lightShadowMap, linearSampler, uv + offset, depth - bias);
+        }
+    }
+    visibility /= f32((PCF_RADIUS*2+1)*(PCF_RADIUS*2+1));
+
+    return vec4f(fragColor*visibility,1.0);
+}
+                `
+
+        let shader = new Shader(context, code);
+
+
+        let camera = new Camera(context.canvas, [120, 30, 0], 60 * Math.PI / 180, 1)
+        camera.tick();
+
+        let modelMatrix = mat4.create();
+        mat4.scale(modelMatrix, modelMatrix, [0.5, 0.5, 0.5])
+        mat4.rotateX(modelMatrix, modelMatrix, 90 * Math.PI / 180)
+        // mat4.translate(modelMatrix, modelMatrix, [0, 0, -20])
+        let modelMatrixBuffer = Buffer.createUniform(context, new Float32Array(modelMatrix))
+
+        let projectMatrixBuffer = Buffer.createUniform(context, new Float32Array(camera.projectionMatrix));
+        let viewMatrixBuffer = Buffer.createUniform(context, 64);
+        let linearSampler = new Sampler(context, {
+            compare: "less",
+        })
+        let inverseMatrixBuffer = Buffer.createUniform(context, 64);
+
+        let lightViewMatrix = mat4.create()
+        mat4.lookAt(lightViewMatrix, [100, 100, 100], [0, 0, 0], [0, 1, 0])
+
+        let lightProjectMatrix = mat4.create();
+        mat4.orthoZO(lightProjectMatrix, -200, 200, -200, 200, 1, 400);
+
+        let inverseLightMatrix = mat4.create();
+        mat4.mul(inverseLightMatrix, lightProjectMatrix, lightViewMatrix);
+
+        let renderCommandEncoder = new CommandEncoder(context);
+        //render
+        let renderTarget = RenderTarget.createDefault(context);
+        let renderPass = new Pass(renderTarget)
+        renderCommandEncoder.addPass(renderPass)
+
+        //shadow
+        let shadowCommandEncoder = new CommandEncoder(context);
+
+        let shadowTarget = new RenderTarget([], new Attachment({
+            texture: new Texture(context, {
+                label: 'depth texture',
+                size: [1024, 1024, 1],
+                format: 'depth24plus',
+            }),
+            clearValue: 1
+        }))
+        let shadowPass = new Pass(shadowTarget)
+        shadowCommandEncoder.addPass(shadowPass)
+
+        let meshShadowPass = createShadowPass(shadowTarget, modelMatrixBuffer, projectMatrixBuffer, viewMatrixBuffer);
+        let meshPass = createMeshPass(shader, renderTarget, modelMatrixBuffer, projectMatrixBuffer, viewMatrixBuffer, shadowTarget);
+
+        shadowPass.add(meshShadowPass)
+        renderPass.add(meshPass)
+
+        function frame() {
+            camera.tick();
+
+            //shadow pass
+            projectMatrixBuffer.uploadData(0, new Float32Array(lightProjectMatrix))
+            viewMatrixBuffer.uploadData(0, new Float32Array(lightViewMatrix))
+            shadowCommandEncoder.submit();
+
+            //render pass
+            projectMatrixBuffer.uploadData(0, new Float32Array(camera.projectionMatrix))
+            viewMatrixBuffer.uploadData(0, new Float32Array(camera.viewMatrix))
+            inverseMatrixBuffer.uploadData(0, inverseLightMatrix)
+
+            renderTarget.colorAttachments[0].setTexture(context.getCurrentTexture())
+            // renderPass.updateRenderDescriptor(renderTarget.getRenderDescriptor())
+            renderCommandEncoder.submit();
+
+            requestAnimationFrame(frame)
+        }
+
+        requestAnimationFrame(frame)
+
+
+        function createShadowPass(renderTarget, modelMatrixBuffer, projectMatrixBuffer, viewMatrixBuffer) {
+            let code = `
+        @group(0) @binding(0) var<uniform> modelMatrix: mat4x4f;
+        @group(0) @binding(1) var<uniform> viewMatrix: mat4x4f;
+        @group(0) @binding(2) var<uniform> projectionMatrix: mat4x4f;
+        
+        struct VertexOutput {
+          @builtin(position) Position : vec4f,
+          @location(0) fragColor: vec3f
+        }
+        
+        @vertex
+        fn main(    
+            @location(0) position: vec3f,
+            @location(1) normal : vec3f) -> VertexOutput {
+          var output : VertexOutput;
+          output.Position = projectionMatrix*viewMatrix*modelMatrix*vec4f(position,1.0);
+          output.fragColor = normalize(normal)*0.5+0.5;
+          return output;
+        }
+        @fragment
+        fn main_fs(@location(0) fragColor: vec3f) -> @location(0) vec4f {
+            return vec4f(fragColor,1.0);
+        }
+                `
+
+            let shader = new Shader(context, code);
+
+            let bindGroup = BindGroup.create(context, shader.getBindGroupLayout(0), {
+                modelMatrix: new BufferBinding(modelMatrixBuffer),
+                viewMatrix: new BufferBinding(viewMatrixBuffer),
+                projectionMatrix: new BufferBinding(projectMatrixBuffer),
+            })
+
+            let vertexStae = new VertexState(context, {
+                attributes: {
+                    positions: new Attribute(0, 'vec3f', mesh.positions),
+                    normal: new Attribute(1, 'vec3f', mesh.normals)
+                }
+            })
+            let indexState = new IndexState(context, mesh.triangles)
+            let drawCount = mesh.triangles.length;
+
+            let pipeline = new Pipeline(context, {
+                shader,
+                renderTarget,
+                bufferLayouts: [vertexStae.bufferLayout],
+                primitive: {
+                    cullMode: 'none'
+                }
+            })
+
+            let subpass = new PassNode({
+                label: 'mesh-shadow',
+                pipeline,
+                bindGroups: [bindGroup],
+                vertexStates: [vertexStae],
+                indexState: indexState,
+                drawCount: drawCount
+            })
+
+            return subpass;
+        }
+
+        function createMeshPass(shader, renderTarget, modelMatrixBuffer, projectMatrixBuffer, viewMatrixBuffer, shadowTarget) {
+
+            let bindGroup = BindGroup.create(context, shader.getBindGroupLayout(0), {
+                modelMatrix: new BufferBinding(modelMatrixBuffer),
+                viewMatrix: new BufferBinding(viewMatrixBuffer),
+                projectionMatrix: new BufferBinding(projectMatrixBuffer),
+                lightShadowMap: shadowTarget.depthAttachment.texture,
+                linearSampler: linearSampler,
+                lightViewMatrix: new BufferBinding(inverseMatrixBuffer)
+            })
+
+            let vertexStae = new VertexState(context, {
+                attributes: {
+                    positions: new Attribute(0, 'vec3f', mesh.positions),
+                    normal: new Attribute(1, 'vec3f', mesh.normals)
+                }
+            })
+            let indexState = new IndexState(context, mesh.triangles)
+            let drawCount = mesh.triangles.length;
+
+            let pipeline = new Pipeline(context, {
+                label: 'mesh-render',
+                shader,
+                renderTarget,
+                bufferLayouts: [vertexStae.bufferLayout],
+                primitive: {
+                    cullMode: 'none'
+                }
+            })
+
+            let subpass = new PassNode({
+                pipeline,
+                bindGroups: [bindGroup],
+                vertexStates: [vertexStae],
+                indexState: indexState,
+                drawCount: drawCount
+            })
+
+            return subpass;
+        }
+
+    </script>
+
+</body>
+
+</html>
