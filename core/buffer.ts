@@ -8,6 +8,10 @@ import { Resource } from './resource';
  */
 export class Buffer extends Resource {
 
+    public static create(context: Context, dataOrSize: TypeArray | number, usage: string[], label?: string) {
+        return new Buffer(context, dataOrSize, usage, label);
+    }
+
     public static createVertex(context: Context, dataOrSize: TypeArray | number, label?: string): Buffer {
         return new Buffer(context, dataOrSize, BufferUsage.VERTEX | BufferUsage.COPY_DST, label);
     }
@@ -24,14 +28,33 @@ export class Buffer extends Resource {
         return new Buffer(context, dataOrSize, BufferUsage.STORAGE | BufferUsage.COPY_DST, label);
     }
 
+    static copyBufferToBuffer(context: Context, srcBuffer: GPUBuffer, srcOffset: number, dstBuffer: GPUBuffer, dstOffset: number, dstSize: number) {
+        const commandEncoder = context.device.createCommandEncoder();
+        commandEncoder.copyBufferToBuffer(
+            srcBuffer,
+            srcOffset,
+            dstBuffer,
+            dstOffset,
+            dstSize,
+        );
+        context.device.queue.submit([commandEncoder.finish()]);
+    }
+
     handle: GPUBuffer;
     size: number
     ref: number = 0
 
-    constructor(context: Context, dataOrSize: TypeArray | number, usage: BufferUsage, label?: string) {
+    constructor(context: Context, dataOrSize: TypeArray | number, usage: BufferUsage | string[], label?: string) {
         super(context)
         let unAlignedSize = Number.isInteger(dataOrSize) ? <number>dataOrSize : (<TypeArray>dataOrSize).byteLength;
         this.size = byteAlign(unAlignedSize);
+        if (Array.isArray(usage)) { //array type for usage
+            let list = [...usage];
+            usage = <BufferUsage>0;
+            for (let s of list) {
+                usage |= BufferUsage[s.toUpperCase()]
+            }
+        }
         this.handle = context.device.createBuffer({
             label: label,
             size: this.size,
@@ -42,6 +65,12 @@ export class Buffer extends Resource {
             this.uploadData(0, data, data.byteOffset);
         }
         return this;
+    }
+
+    clear() {
+        const commandEncoder = this.context.device.createCommandEncoder();
+        commandEncoder.clearBuffer(this.handle);
+        this.context.device.queue.submit([commandEncoder.finish()]);
     }
 
     // https://github.com/gpuweb/gpuweb/blob/main/design/BufferOperations.md
@@ -57,21 +86,14 @@ export class Buffer extends Resource {
         });
         new Uint8Array(srcBuffer.getMappedRange()).set(new Uint8Array(srcArrayBuffer, offset, size)); // memcpy
         srcBuffer.unmap();
-        this.copyToBuffer(srcBuffer, 0, bufferOffset, byteSize);
+        Buffer.copyBufferToBuffer(this.context, srcBuffer, 0, this.handle, bufferOffset, byteSize);
         srcBuffer.destroy();
     }
 
-    copyToBuffer(srcBuffer: GPUBuffer, srcOffset: number, dstOffset: number, dstSize: number): void {
-        const commandEncoder = this.context.device.createCommandEncoder();
-        commandEncoder.copyBufferToBuffer(
-            srcBuffer,
-            srcOffset,
-            this.handle,
-            dstOffset,
-            dstSize,
-        );
-        this.context.device.queue.submit([commandEncoder.finish()]);
+    copyToBuffer(srcOffset: number, dstBuffer: Buffer, dstOffset: number, dstSize: number): void {
+        Buffer.copyBufferToBuffer(this.context, this.handle, srcOffset, dstBuffer.handle, dstOffset, dstSize)
     }
+
     //
     copyToTexture(source: GPUTexelCopyBufferInfo, destination: GPUTexelCopyTextureInfo, extent: GPUExtent3D,): void {
         const commandEncoder = this.context.device.createCommandEncoder();
